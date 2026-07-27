@@ -1,0 +1,37 @@
+{
+  "name": "claude-for-codex",
+  "version": "0.1.0",
+  "description": "Ask the local Claude Code CLI for a read-only second opinion on code changes.",
+  "author": {
+    "name": "Mouaad Aallam",
+    "url": "https://github.com/aallam"
+  },
+  "homepage": "https://github.com/aallam/codex-plugins/tree/main/plugins/claude-for-codex",
+  "repository": "https://github.com/aallam/codex-plugins",
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "code-review",
+    "second-opinion",
+    "adversarial-review"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Claude for Codex",
+    "shortDescription": "Get a read-only Claude review from Codex",
+    "longDescription": "Ask Codex to run the local Claude Code CLI as an independent, read-only reviewer of working-tree or branch changes.",
+    "developerName": "Mouaad Aallam",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "websiteURL": "https://github.com/aallam/codex-plugins/tree/main/plugins/claude-for-codex",
+    "defaultPrompt": [
+      "Ask Claude to review my current changes.",
+      "Have Claude challenge this branch against main.",
+      "Get a Claude second opinion focused on security."
+    ],
+    "brandColor": "#D97757"
+  }
+}

@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""Run a structured, read-only Claude review of Git changes."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from typing import Any, Sequence
+
+
+DEFAULT_MAX_DIFF_BYTES = 400_000
+DEFAULT_MAX_BUDGET_USD = 2.0
+DEFAULT_TIMEOUT_SECONDS = 600
+READ_ONLY_TOOLS = "Read,Glob,Grep"
+REVIEW_PATHS = [
+    ".",
+    ":(exclude,glob).env",
+    ":(exclude,glob).env.*",
+    ":(exclude,glob)**/.env",
+    ":(exclude,glob)**/.env.*",
+    ":(exclude,glob)**/.envrc",
+    ":(exclude,glob)**/.netrc",
+    ":(exclude,glob)**/.npmrc",
+    ":(exclude,glob)**/.pypirc",
+    ":(exclude,glob)**/*.pem",
+    ":(exclude,glob)**/*.key",
+    ":(exclude,glob)**/*.p12",
+    ":(exclude,glob)**/*.pfx",
+    ":(exclude,glob)**/*.jks",
+    ":(exclude,glob)**/*.keystore",
+    ":(exclude,glob)**/*.kdbx",
+    ":(exclude,glob)**/id_rsa",
+    ":(exclude,glob)**/id_ed25519",
+    ":(exclude,glob)**/*credentials*.json",
+    ":(exclude,glob)**/*secret*.json",
+    ":(exclude,glob)**/*secret*.yaml",
+    ":(exclude,glob)**/*secret*.yml",
+]
+REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["verdict", "summary", "findings", "coverage_gaps", "next_steps"],
+    "properties": {
+        "verdict": {
+            "type": "string",
+            "enum": ["approve", "approve_with_notes", "request_changes"],
+        },
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "severity",
+                    "title",
+                    "file",
+                    "line",
+                    "evidence",
+                    "recommendation",
+                    "confidence",
+                ],
+                "properties": {
+                    "severity": {
+                        "type": "string",
+                        "enum": ["blocker", "high", "medium", "low"],
+                    },
+                    "title": {"type": "string"},
+                    "file": {"type": "string"},
+                    "line": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 1},
+                            {"type": "null"},
+                        ]
+                    },
+                    "evidence": {"type": "string"},
+                    "recommendation": {"type": "string"},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                },
+            },
+        },
+        "coverage_gaps": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "next_steps": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+}
+
+
+class ReviewError(RuntimeError):
+    """A user-actionable review failure."""
+
+
+def run(
+    command: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    check: bool = True,
+    timeout: int | None = 120,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess without a shell."""
+    try:
+        process = subprocess.run(
+            list(command),
+            cwd=cwd,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ReviewError(
+            f"Command timed out after {timeout} seconds: {command[0]}"
+        ) from error
+    if check and process.returncode != 0:
+        detail = (process.stderr or process.stdout).strip()
+        raise ReviewError(detail or f"Command failed: {' '.join(command)}")
+    return process
+
+
+def find_repo_root(start: Path) -> Path:
+    """Return the Git repository root containing start."""
+    result = run(["git", "rev-parse", "--show-toplevel"], cwd=start)
+    return Path(result.stdout.strip()).resolve()
+
+
+def validate_base(repo_root: Path, base: str) -> None:
+    """Reject a base ref that Git cannot resolve to a commit."""
+    run(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], cwd=repo_root)
+
+
+def collect_review_context(
+    repo_root: Path,
+    *,
+    base: str | None,
+    max_diff_bytes: int,
+) -> tuple[str, str]:
+    """Collect a bounded Git diff and return its human-readable scope."""
+    if base:
+        validate_base(repo_root, base)
+        merge_base = run(["git", "merge-base", base, "HEAD"], cwd=repo_root).stdout.strip()
+        scope = f"committed branch changes from merge-base {merge_base} ({base}...HEAD)"
+        status = run(
+            [
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                f"{merge_base}..HEAD",
+                "--",
+                *REVIEW_PATHS,
+            ],
+            cwd=repo_root,
+        ).stdout
+        diff = run(
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--find-renames",
+                "--unified=40",
+                f"{merge_base}..HEAD",
+                "--",
+                *REVIEW_PATHS,
+            ],
+            cwd=repo_root,
+        ).stdout
+    else:
+        scope = "current staged, unstaged, and untracked working-tree changes"
+        status = run(
+            [
+                "git",
+                "status",
+                "--short",
+                "--untracked-files=all",
+                "--",
+                *REVIEW_PATHS,
+            ],
+            cwd=repo_root,
+        ).stdout
+        unstaged = run(
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--find-renames",
+                "--unified=40",
+                "--",
+                *REVIEW_PATHS,
+            ],
+            cwd=repo_root,
+        ).stdout
+        staged = run(
+            [
+                "git",
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--find-renames",
+                "--unified=40",
+                "--",
+                *REVIEW_PATHS,
+            ],
+            cwd=repo_root,
+        ).stdout
+        diff = "\n".join(
+            section
+            for section in (
+                "## Unstaged diff\n" + unstaged if unstaged else "",
+                "## Staged diff\n" + staged if staged else "",
+            )
+            if section
+        )
+
+    if not status.strip():
+        raise ReviewError(f"No changes found for {scope}.")
+
+    context = (
+        "## Git status / changed paths\n"
+        f"{status}\n"
+        "Common secret-bearing paths are excluded from both this list and the "
+        "supplied diff.\n\n"
+        "## Diff\n"
+        f"{diff or '(No textual diff; inspect listed untracked or binary files.)'}"
+    )
+    context_size = len(context.encode("utf-8"))
+    if context_size > max_diff_bytes:
+        raise ReviewError(
+            f"Review context is {context_size:,} bytes, above the "
+            f"{max_diff_bytes:,}-byte safety limit. Narrow the change or pass "
+            "--max-diff-bytes with an intentional larger value."
+        )
+    return scope, context
+
+
+def build_prompt(
+    *,
+    repo_root: Path,
+    scope: str,
+    context: str,
+    adversarial: bool,
+    focus: str | None,
+    allow_repo_read: bool,
+) -> str:
+    """Build the Claude reviewer prompt."""
+    mode = (
+        "Act as an adversarial reviewer. Pressure-test the chosen design, hidden "
+        "assumptions, failure modes, and whether a simpler or safer approach exists."
+        if adversarial
+        else "Act as a pragmatic senior code reviewer."
+    )
+    focus_text = focus.strip() if focus and focus.strip() else "No additional focus."
+    context_access = (
+        "You may use Read, Glob, and Grep for surrounding repository context. "
+        "Never inspect secret-bearing paths."
+        if allow_repo_read
+        else "Do not use repository tools. Review only the supplied diff context."
+    )
+    return f"""You are an independent reviewer. {mode}
+
+Repository: {repo_root}
+Review scope: {scope}
+Focus: {focus_text}
+
+Hard constraints:
+- This is a read-only review. Never edit files or suggest that you edited them.
+- {context_access}
+- Do not open or quote secrets, credentials, private keys, .env files, or auth tokens.
+- Report only actionable correctness, security, reliability, performance, or
+  maintainability problems introduced by this change.
+- Do not report style preferences, generic best practices, or pre-existing issues.
+- Verify each finding against surrounding code before reporting it.
+- Use repository-relative file paths and the tightest relevant line number.
+- If evidence is incomplete, lower confidence or put it in coverage_gaps instead.
+
+Return the requested structured review with findings ordered by severity.
+
+{context}
+"""
+
+
+def build_claude_command(args: argparse.Namespace) -> list[str]:
+    """Build the Claude CLI command with a strict read-only tool allowlist."""
+    command = [
+        args.claude_binary,
+        "--print",
+        "--output-format",
+        "json",
+        "--json-schema",
+        json.dumps(REVIEW_SCHEMA, separators=(",", ":")),
+        "--permission-mode",
+        "plan",
+        "--tools",
+        READ_ONLY_TOOLS if args.allow_repo_read else "",
+        "--safe-mode",
+        "--no-chrome",
+        "--no-session-persistence",
+        "--max-budget-usd",
+        str(args.max_budget_usd),
+    ]
+    if args.model:
+        command.extend(["--model", args.model])
+    if args.effort:
+        command.extend(["--effort", args.effort])
+    return command
+
+
+def validate_review(review: dict[str, Any]) -> dict[str, Any]:
+    """Validate Claude output before it reaches the renderer."""
+    required = REVIEW_SCHEMA["required"]
+    missing = [key for key in required if key not in review]
+    if missing:
+        raise ReviewError(
+            f"Claude review is missing required fields: {', '.join(missing)}"
+        )
+    if review["verdict"] not in {"approve", "approve_with_notes", "request_changes"}:
+        raise ReviewError("Claude review has an invalid verdict.")
+    if not isinstance(review["summary"], str):
+        raise ReviewError("Claude review field 'summary' must be a string.")
+    for field in ("findings", "coverage_gaps", "next_steps"):
+        if not isinstance(review[field], list):
+            raise ReviewError(f"Claude review field '{field}' must be an array.")
+    for field in ("coverage_gaps", "next_steps"):
+        if not all(isinstance(item, str) for item in review[field]):
+            raise ReviewError(f"Claude review field '{field}' must contain strings.")
+
+    finding_fields = {
+        "severity",
+        "title",
+        "file",
+        "line",
+        "evidence",
+        "recommendation",
+        "confidence",
+    }
+    for index, finding in enumerate(review["findings"]):
+        if not isinstance(finding, dict):
+            raise ReviewError(f"Claude finding {index + 1} must be an object.")
+        missing_finding = finding_fields - finding.keys()
+        if missing_finding:
+            raise ReviewError(
+                f"Claude finding {index + 1} is missing fields: "
+                f"{', '.join(sorted(missing_finding))}"
+            )
+        if finding["severity"] not in {"blocker", "high", "medium", "low"}:
+            raise ReviewError(f"Claude finding {index + 1} has invalid severity.")
+        if finding["confidence"] not in {"high", "medium", "low"}:
+            raise ReviewError(f"Claude finding {index + 1} has invalid confidence.")
+        for field in ("title", "file", "evidence", "recommendation"):
+            if not isinstance(finding[field], str):
+                raise ReviewError(
+                    f"Claude finding {index + 1} field '{field}' must be a string."
+                )
+        line = finding["line"]
+        if line is not None and (
+            not isinstance(line, int) or isinstance(line, bool) or line < 1
+        ):
+            raise ReviewError(
+                f"Claude finding {index + 1} field 'line' must be null or positive."
+            )
+    return review
+
+
+def extract_review(stdout: str) -> dict[str, Any]:
+    """Extract structured output from Claude's JSON envelope."""
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise ReviewError(f"Claude returned invalid JSON: {error}") from error
+
+    if isinstance(payload, dict):
+        structured = payload.get("structured_output")
+        if isinstance(structured, dict):
+            return validate_review(structured)
+
+        result = payload.get("result")
+        if isinstance(result, dict):
+            return validate_review(result)
+        if isinstance(result, str):
+            try:
+                decoded = json.loads(result)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                return validate_review(decoded)
+
+        if all(key in payload for key in REVIEW_SCHEMA["required"]):
+            return validate_review(payload)
+
+    raise ReviewError("Claude did not return the expected structured review.")
+
+
+def render_markdown(review: dict[str, Any]) -> str:
+    """Render structured review data for a human."""
+    lines = [
+        f"# Claude review: {str(review['verdict']).replace('_', ' ')}",
+        "",
+        str(review["summary"]).strip(),
+    ]
+    findings = review.get("findings", [])
+    if findings:
+        lines.extend(["", "## Findings"])
+        for finding in findings:
+            location = str(finding["file"])
+            if finding.get("line"):
+                location += f":{finding['line']}"
+            lines.extend(
+                [
+                    "",
+                    f"- [{str(finding['severity']).upper()}] {finding['title']} "
+                    f"({location}, confidence: {finding['confidence']})",
+                    f"  Evidence: {finding['evidence']}",
+                    f"  Recommendation: {finding['recommendation']}",
+                ]
+            )
+    else:
+        lines.extend(["", "No actionable findings."])
+
+    coverage_gaps = review.get("coverage_gaps", [])
+    if coverage_gaps:
+        lines.extend(["", "## Coverage gaps"])
+        lines.extend(f"- {gap}" for gap in coverage_gaps)
+
+    next_steps = review.get("next_steps", [])
+    if next_steps:
+        lines.extend(["", "## Suggested next steps"])
+        lines.extend(f"- {step}" for step in next_steps)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def check_claude(binary: str) -> int:
+    """Report Claude CLI installation and authentication status."""
+    resolved = shutil.which(binary)
+    if not resolved:
+        print(
+            "Claude Code CLI was not found. Install it, then run `claude auth login`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    version = run([resolved, "--version"], check=False)
+    print(f"Claude CLI: {(version.stdout or version.stderr).strip()}")
+    auth = run([resolved, "auth", "status"], check=False)
+    output = (auth.stdout or auth.stderr).strip()
+    try:
+        status = json.loads(output)
+    except json.JSONDecodeError:
+        status = {}
+    if auth.returncode != 0 or status.get("loggedIn") is not True:
+        print("Claude authentication: not logged in")
+        print("Run `claude auth login` in a terminal, then retry.", file=sys.stderr)
+        return 1
+    print(f"Claude authentication: ready ({status.get('authMethod', 'unknown')})")
+    return 0
+
+
+def positive_int(value: str) -> int:
+    """Parse a strictly positive integer."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    """Parse a strictly positive number."""
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Ask Claude for a structured, read-only review of Git changes."
+    )
+    parser.add_argument("--base", help="Review committed branch changes against this ref.")
+    parser.add_argument("--focus", help="Focus the review on a specific risk or question.")
+    parser.add_argument(
+        "--adversarial",
+        action="store_true",
+        help="Challenge design choices, assumptions, and failure modes.",
+    )
+    parser.add_argument("--model", help="Optional Claude model or alias.")
+    parser.add_argument(
+        "--effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="Optional Claude reasoning effort.",
+    )
+    parser.add_argument("--json", action="store_true", help="Print structured JSON.")
+    parser.add_argument(
+        "--max-diff-bytes",
+        type=positive_int,
+        default=DEFAULT_MAX_DIFF_BYTES,
+        help=f"Maximum review context size (default: {DEFAULT_MAX_DIFF_BYTES}).",
+    )
+    parser.add_argument(
+        "--allow-repo-read",
+        action="store_true",
+        help="Allow Claude to inspect repository files beyond the supplied diff.",
+    )
+    parser.add_argument(
+        "--max-budget-usd",
+        type=positive_float,
+        default=DEFAULT_MAX_BUDGET_USD,
+        help=f"Maximum Claude API budget (default: {DEFAULT_MAX_BUDGET_USD}).",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=positive_int,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"Maximum review runtime (default: {DEFAULT_TIMEOUT_SECONDS}).",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check Claude installation and authentication without reviewing.",
+    )
+    parser.add_argument(
+        "--claude-binary",
+        default=os.environ.get("CLAUDE_FOR_CODEX_BINARY", "claude"),
+        help=argparse.SUPPRESS,
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run setup diagnostics or a Claude review."""
+    args = parse_args(argv)
+    if args.check:
+        return check_claude(args.claude_binary)
+
+    resolved = shutil.which(args.claude_binary)
+    if not resolved:
+        raise ReviewError(
+            "Claude Code CLI was not found. Install it and run `claude auth login`."
+        )
+    args.claude_binary = resolved
+
+    repo_root = find_repo_root(Path.cwd())
+    scope, context = collect_review_context(
+        repo_root,
+        base=args.base,
+        max_diff_bytes=args.max_diff_bytes,
+    )
+    prompt = build_prompt(
+        repo_root=repo_root,
+        scope=scope,
+        context=context,
+        adversarial=args.adversarial,
+        focus=args.focus,
+        allow_repo_read=args.allow_repo_read,
+    )
+    result = run(
+        build_claude_command(args),
+        cwd=repo_root,
+        input_text=prompt,
+        check=False,
+        timeout=args.timeout_seconds,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ReviewError(detail or "Claude review failed.")
+
+    review = extract_review(result.stdout)
+    if args.json:
+        print(json.dumps(review, indent=2))
+    else:
+        print(render_markdown(review), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ReviewError as error:
+        print(f"claude-review: {error}", file=sys.stderr)
+        raise SystemExit(2) from error

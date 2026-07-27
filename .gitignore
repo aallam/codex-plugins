@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+!.agents/
+!.agents/plugins/
+!.agents/plugins/marketplace.json
