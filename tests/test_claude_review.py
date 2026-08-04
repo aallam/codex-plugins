@@ -156,6 +156,26 @@ class ClaudeReviewTests(unittest.TestCase):
         with mock.patch.object(claude_review.shutil, "which", return_value=None):
             self.assertEqual(claude_review.check_claude("claude"), 1)
 
+    def test_check_explains_macos_sandbox_auth_false_negative(self) -> None:
+        version = mock.Mock(stdout="2.1.221\n", stderr="", returncode=0)
+        auth = mock.Mock(
+            stdout=json.dumps({"loggedIn": False}),
+            stderr="",
+            returncode=1,
+        )
+
+        with (
+            mock.patch.object(claude_review.shutil, "which", return_value="/bin/claude"),
+            mock.patch.object(claude_review, "run", side_effect=[version, auth]),
+            mock.patch.object(claude_review.sys, "platform", "darwin"),
+            mock.patch("builtins.print") as printer,
+        ):
+            self.assertEqual(claude_review.check_claude("claude"), 1)
+
+        output = "\n".join(str(call.args[0]) for call in printer.call_args_list)
+        self.assertIn("scoped sandbox escalation", output)
+        self.assertIn("Login Keychain", output)
+
     def test_main_uses_fake_claude_in_a_git_repo(self) -> None:
         review = {
             "verdict": "approve",

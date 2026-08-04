@@ -462,7 +462,20 @@ def check_claude(binary: str) -> int:
         status = {}
     if auth.returncode != 0 or status.get("loggedIn") is not True:
         print("Claude authentication: not logged in")
-        print("Run `claude auth login` in a terminal, then retry.", file=sys.stderr)
+        if sys.platform == "darwin":
+            print(
+                "If this check ran inside the Codex sandbox, retry the exact "
+                "command with scoped sandbox escalation so Claude can access "
+                "macOS Login Keychain.",
+                file=sys.stderr,
+            )
+            print(
+                "If it still fails outside the sandbox, run `claude auth login` "
+                "in a terminal, then retry.",
+                file=sys.stderr,
+            )
+        else:
+            print("Run `claude auth login` in a terminal, then retry.", file=sys.stderr)
         return 1
     print(f"Claude authentication: ready ({status.get('authMethod', 'unknown')})")
     return 0

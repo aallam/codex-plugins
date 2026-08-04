@@ -40,8 +40,13 @@ Run it with the user's repository as the current working directory.
    <plugin-root>/scripts/claude-review --check
    ```
 
-   If Claude is missing or not authenticated, report the exact diagnostic and
-   stop. Do not start an interactive login without the user's request.
+   On macOS, run this exact command with a scoped sandbox escalation. Claude
+   Code commonly stores authentication in Login Keychain, which is unavailable
+   to a sandboxed subprocess and can produce a false "not logged in" result.
+   If a check was already run inside the sandbox and failed authentication,
+   treat it as inconclusive and retry it once outside the sandbox. If the
+   escalated check still fails, report the exact diagnostic and stop. Do not
+   start an interactive login without the user's request.
 
 2. Choose exactly one review scope:
 
@@ -76,7 +81,13 @@ Run it with the user's repository as the current working directory.
    inspect repository files beyond the supplied diff. This enables `Read`,
    `Glob`, and `Grep`, but remains read-only.
 
-7. Verify Claude's findings locally:
+7. On macOS, run the selected review command with the same scoped sandbox
+   escalation used for `--check`; the review process needs the same Keychain
+   credential. Escalate only the bundled wrapper command, not the whole Codex
+   session. The wrapper still restricts Claude to its documented read-only
+   tools and filtered context.
+
+8. Verify Claude's findings locally:
 
    - Open the cited files and lines.
    - Confirm the behavior is introduced by the reviewed changes.
