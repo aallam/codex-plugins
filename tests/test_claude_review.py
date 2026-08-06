@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.machinery
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -48,6 +49,11 @@ class ClaudeReviewTests(unittest.TestCase):
         command = claude_review.build_claude_command(args)
 
         self.assertIn("--permission-mode", command)
+        self.assertIn("--verbose", command)
+        self.assertEqual(
+            command[command.index("--output-format") + 1],
+            "stream-json",
+        )
         self.assertEqual(command[command.index("--permission-mode") + 1], "plan")
         self.assertEqual(command[command.index("--tools") + 1], "")
         self.assertNotIn("Edit", command)
@@ -105,6 +111,229 @@ class ClaudeReviewTests(unittest.TestCase):
         )
 
         self.assertEqual(actual, expected)
+
+    def test_extracts_structured_output_from_stream(self) -> None:
+        expected = {
+            "verdict": "approve",
+            "summary": "Looks good.",
+            "findings": [],
+            "coverage_gaps": [],
+            "next_steps": [],
+        }
+        stream = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "model": "claude-sonnet-4-6",
+                    }
+                ),
+                json.dumps({"type": "assistant", "message": {"content": []}}),
+                json.dumps({"type": "result", "structured_output": expected}),
+            ]
+        )
+
+        self.assertEqual(claude_review.extract_stream_review(stream), expected)
+
+    def test_progress_event_does_not_expose_tool_input(self) -> None:
+        event = claude_review.progress_event(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/repo/private-name.py"},
+                        }
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual(
+            event,
+            (
+                "tool:Read",
+                "Claude is inspecting repository context with Read.",
+            ),
+        )
+        assert event is not None
+        self.assertNotIn("private-name.py", event[1])
+
+    def test_stream_runner_reports_truthful_heartbeat(self) -> None:
+        review = {
+            "verdict": "approve",
+            "summary": "Looks good.",
+            "findings": [],
+            "coverage_gaps": [],
+            "next_steps": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            fake_claude = Path(directory) / "fake-claude"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "import sys\n"
+                "import time\n"
+                "sys.stdin.read()\n"
+                "time.sleep(0.08)\n"
+                f"print(json.dumps({{'type': 'result', "
+                f"'structured_output': {review!r}}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            progress = io.StringIO()
+
+            with mock.patch.object(claude_review, "PROGRESS_INTERVAL_SECONDS", 0.02):
+                result = claude_review.run_claude_stream(
+                    [str(fake_claude)],
+                    cwd=Path(directory),
+                    input_text="review this",
+                    timeout=1,
+                    context_size=11,
+                    requested_model=None,
+                    effort=None,
+                    progress_stream=progress,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(claude_review.extract_stream_review(result.stdout), review)
+        self.assertIn("Claude is still reviewing", progress.getvalue())
+        self.assertIn("No completion estimate is available", progress.getvalue())
+
+    def test_stream_runner_heartbeats_while_events_are_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake_claude = Path(directory) / "fake-claude"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "import sys\n"
+                "sys.stdin.read()\n"
+                "for index in range(20000):\n"
+                "    print(json.dumps({'type': 'system', 'subtype': "
+                "'activity', 'index': index}), flush=True)\n"
+                "\n",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            progress = io.StringIO()
+
+            with mock.patch.object(claude_review, "PROGRESS_INTERVAL_SECONDS", 0.001):
+                result = claude_review.run_claude_stream(
+                    [str(fake_claude)],
+                    cwd=Path(directory),
+                    input_text="review this",
+                    timeout=1,
+                    context_size=11,
+                    requested_model=None,
+                    effort=None,
+                    progress_stream=progress,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertGreaterEqual(
+            progress.getvalue().count("Claude is still reviewing"),
+            2,
+        )
+
+    def test_stream_runner_bounds_stalled_stdin_by_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake_claude = Path(directory) / "fake-claude"
+            fake_claude.write_text(
+                "#!/usr/bin/env python3\n"
+                "import time\n"
+                "time.sleep(2)\n",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+            started_at = claude_review.time.monotonic()
+            with self.assertRaisesRegex(claude_review.ReviewError, "timed out"):
+                claude_review.run_claude_stream(
+                    [str(fake_claude)],
+                    cwd=Path(directory),
+                    input_text="x" * 400_000,
+                    timeout=0.1,
+                    context_size=400_000,
+                    requested_model=None,
+                    effort=None,
+                    progress_stream=io.StringIO(),
+                )
+
+        self.assertLess(claude_review.time.monotonic() - started_at, 1)
+
+    def test_stream_runner_handles_early_exit_without_broken_pipe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake_claude = Path(directory) / "fake-claude"
+            fake_claude.write_text(
+                "#!/bin/sh\n"
+                "echo 'unsupported option' >&2\n"
+                "exit 2\n",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+            result = claude_review.run_claude_stream(
+                [str(fake_claude)],
+                cwd=Path(directory),
+                input_text="x" * 400_000,
+                timeout=1,
+                context_size=400_000,
+                requested_model=None,
+                effort=None,
+                progress_stream=io.StringIO(),
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsupported option", result.stderr)
+
+    def test_failure_detail_uses_only_final_stdout_error(self) -> None:
+        stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"content": "private partial reasoning"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_max_budget_usd",
+                        "is_error": True,
+                        "result": "Maximum budget reached.",
+                    }
+                ),
+            ]
+        )
+
+        detail = claude_review.failure_detail("", stdout)
+
+        self.assertIn("error_max_budget_usd", detail)
+        self.assertIn("Maximum budget reached", detail)
+        self.assertNotIn("private partial reasoning", detail)
+
+    def test_failure_detail_handles_missing_error_event(self) -> None:
+        self.assertEqual(
+            claude_review.failure_detail("", ""),
+            "Claude review failed without an error message.",
+        )
+
+    def test_extract_stream_review_explains_missing_result(self) -> None:
+        stream = "\n".join(
+            [
+                json.dumps({"type": "system", "subtype": "init"}),
+                json.dumps({"type": "assistant", "message": {"content": []}}),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            claude_review.ReviewError,
+            "ended before returning a final result event",
+        ):
+            claude_review.extract_stream_review(stream)
 
     def test_rejects_incomplete_structured_output(self) -> None:
         with self.assertRaisesRegex(claude_review.ReviewError, "missing required"):
@@ -200,7 +429,11 @@ class ClaudeReviewTests(unittest.TestCase):
                     "collect_review_context",
                     return_value=("working tree", "diff"),
                 ),
-                mock.patch.object(claude_review, "run", return_value=run_result) as runner,
+                mock.patch.object(
+                    claude_review,
+                    "run_claude_stream",
+                    return_value=run_result,
+                ) as runner,
                 mock.patch("builtins.print"),
             ):
                 exit_code = claude_review.main(["--claude-binary", str(claude), "--json"])
@@ -251,7 +484,13 @@ class ClaudeReviewTests(unittest.TestCase):
                 "import sys\n"
                 f"Path({str(captured_prompt)!r}).write_text("
                 "sys.stdin.read(), encoding='utf-8')\n"
-                f"print(json.dumps({{'structured_output': {review!r}}}))\n",
+                "print(json.dumps({'type': 'system', 'subtype': 'init', "
+                "'model': 'claude-test'}), flush=True)\n"
+                "print(json.dumps({'type': 'assistant', 'message': {'content': ["
+                "{'type': 'tool_use', 'name': 'Read', "
+                "'input': {'file_path': '/private/path.py'}}]}}), flush=True)\n"
+                f"print(json.dumps({{'type': 'result', "
+                f"'structured_output': {review!r}}}), flush=True)\n",
                 encoding="utf-8",
             )
             fake_claude.chmod(0o755)
@@ -271,6 +510,11 @@ class ClaudeReviewTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), review)
+            self.assertIn("Started review", result.stderr)
+            self.assertIn("Claude initialized using claude-test", result.stderr)
+            self.assertIn("inspecting repository context with Read", result.stderr)
+            self.assertIn("process finished after", result.stderr)
+            self.assertNotIn("/private/path.py", result.stderr)
             prompt = captured_prompt.read_text(encoding="utf-8")
             self.assertIn("value = 2", prompt)
             self.assertNotIn("do-not-send", prompt)

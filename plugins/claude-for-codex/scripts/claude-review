@@ -7,16 +7,21 @@ import argparse
 import json
 import os
 from pathlib import Path
+import queue
 import shutil
 import subprocess
 import sys
-from typing import Any, Sequence
+import threading
+import time
+from typing import Any, Sequence, TextIO
 
 
 DEFAULT_MAX_DIFF_BYTES = 400_000
 DEFAULT_MAX_BUDGET_USD = 2.0
 DEFAULT_TIMEOUT_SECONDS = 600
+PROGRESS_INTERVAL_SECONDS = 30
 READ_ONLY_TOOLS = "Read,Glob,Grep"
+PROGRESS_TOOLS = frozenset(READ_ONLY_TOOLS.split(","))
 REVIEW_PATHS = [
     ".",
     ":(exclude,glob).env",
@@ -130,6 +135,221 @@ def run(
         detail = (process.stderr or process.stdout).strip()
         raise ReviewError(detail or f"Command failed: {' '.join(command)}")
     return process
+
+
+def format_duration(seconds: float) -> str:
+    """Format elapsed seconds as a compact human-readable duration."""
+    total_seconds = max(0, int(seconds))
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    if minutes:
+        return f"{minutes}m {remaining_seconds:02d}s"
+    return f"{remaining_seconds}s"
+
+
+def emit_progress(stream: TextIO, message: str) -> None:
+    """Write a flushed lifecycle update without contaminating review stdout."""
+    print(f"[claude-review] {message}", file=stream, flush=True)
+
+
+def progress_event(payload: dict[str, Any]) -> tuple[str, str] | None:
+    """Return a deduplication key and safe message for a Claude stream event."""
+    event_type = payload.get("type")
+    if event_type == "system" and payload.get("subtype") == "init":
+        model = payload.get("model")
+        detail = f" using {model}" if isinstance(model, str) and model else ""
+        return "initialized", f"Claude initialized{detail}."
+
+    if event_type == "assistant":
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return None
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        tool_names = [
+            block.get("name")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        for tool_name in tool_names:
+            if isinstance(tool_name, str) and tool_name:
+                if tool_name == "StructuredOutput":
+                    return "finalizing", "Claude is finalizing the structured review."
+                if tool_name in PROGRESS_TOOLS:
+                    return (
+                        f"tool:{tool_name}",
+                        f"Claude is inspecting repository context with {tool_name}.",
+                    )
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                return "drafting", "Claude is drafting the structured review."
+
+    return None
+
+
+def run_claude_stream(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    input_text: str,
+    timeout: int,
+    context_size: int,
+    requested_model: str | None,
+    effort: str | None,
+    progress_stream: TextIO = sys.stderr,
+) -> subprocess.CompletedProcess[str]:
+    """Run Claude while forwarding safe lifecycle updates to progress_stream."""
+    started_at = time.monotonic()
+    process = subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        bufsize=1,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def read_stream(name: str, stream: TextIO) -> None:
+        try:
+            for line in stream:
+                events.put((name, line))
+        except (OSError, ValueError):
+            pass
+        finally:
+            events.put((name, None))
+
+    def write_stdin() -> None:
+        try:
+            process.stdin.write(input_text)
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=("stdout", process.stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=("stderr", process.stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+    writer = threading.Thread(target=write_stdin, daemon=True)
+    writer.start()
+
+    deadline = started_at + timeout
+    next_heartbeat = started_at + PROGRESS_INTERVAL_SECONDS
+    model_text = requested_model or "Claude default"
+    effort_text = f", {effort} effort" if effort else ""
+    emit_progress(
+        progress_stream,
+        f"Started review with {model_text}{effort_text}; "
+        f"context: {context_size:,} bytes.",
+    )
+
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    open_streams = {"stdout", "stderr"}
+    emitted_events: set[str] = set()
+
+    try:
+        while open_streams:
+            now = time.monotonic()
+            if now >= deadline:
+                process.kill()
+                process.wait()
+                raise ReviewError(
+                    f"Command timed out after {timeout} seconds: {command[0]}"
+                )
+
+            if now >= next_heartbeat:
+                emit_progress(
+                    progress_stream,
+                    "Claude is still reviewing; elapsed: "
+                    f"{format_duration(now - started_at)}. No completion "
+                    "estimate is available.",
+                )
+                next_heartbeat = now + PROGRESS_INTERVAL_SECONDS
+
+            wait_seconds = max(0.0, min(deadline, next_heartbeat) - now)
+            try:
+                stream_name, line = events.get(timeout=wait_seconds)
+            except queue.Empty:
+                continue
+
+            if line is None:
+                open_streams.discard(stream_name)
+                continue
+            if stream_name == "stderr":
+                stderr_parts.append(line)
+                continue
+
+            stdout_parts.append(line)
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            event = progress_event(payload)
+            if event is None:
+                continue
+            event_key, message = event
+            if event_key not in emitted_events:
+                emitted_events.add(event_key)
+                emit_progress(progress_stream, message)
+
+        remaining_seconds = max(0.0, deadline - time.monotonic())
+        try:
+            process.wait(timeout=remaining_seconds)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait()
+            raise ReviewError(
+                f"Command timed out after {timeout} seconds: {command[0]}"
+            ) from error
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        writer.join(timeout=1)
+        for reader in readers:
+            reader.join(timeout=1)
+        if not readers[0].is_alive():
+            process.stdout.close()
+        if not readers[1].is_alive():
+            process.stderr.close()
+
+    elapsed = time.monotonic() - started_at
+    emit_progress(
+        progress_stream,
+        f"Claude review process finished after {format_duration(elapsed)}.",
+    )
+    return subprocess.CompletedProcess(
+        args=list(command),
+        returncode=process.returncode,
+        stdout="".join(stdout_parts),
+        stderr="".join(stderr_parts),
+    )
 
 
 def find_repo_root(start: Path) -> Path:
@@ -298,8 +518,9 @@ def build_claude_command(args: argparse.Namespace) -> list[str]:
     command = [
         args.claude_binary,
         "--print",
+        "--verbose",
         "--output-format",
-        "json",
+        "stream-json",
         "--json-schema",
         json.dumps(REVIEW_SCHEMA, separators=(",", ":")),
         "--permission-mode",
@@ -402,6 +623,48 @@ def extract_review(stdout: str) -> dict[str, Any]:
             return validate_review(payload)
 
     raise ReviewError("Claude did not return the expected structured review.")
+
+
+def extract_stream_review(stdout: str) -> dict[str, Any]:
+    """Extract the final structured review from Claude stream-json output."""
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    for line in reversed(lines):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("type") == "result":
+            return extract_review(line)
+
+    if len(lines) == 1:
+        # Retain compatibility with fake or older Claude binaries returning one
+        # ordinary JSON envelope despite the requested stream output format.
+        return extract_review(lines[0])
+    raise ReviewError(
+        "Claude stream ended before returning a final result event."
+    )
+
+
+def failure_detail(stderr: str, stdout: str) -> str:
+    """Return a bounded Claude error without exposing its verbose stdout stream."""
+    detail = stderr.strip()
+    if detail:
+        return detail[-4_000:]
+
+    for line in reversed(stdout.splitlines()):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "result":
+            continue
+        subtype = payload.get("subtype")
+        error_result = payload.get("result")
+        label = subtype if isinstance(subtype, str) and subtype else "error"
+        if isinstance(error_result, str) and error_result.strip():
+            return f"Claude review failed ({label}): {error_result.strip()[-1_000:]}"
+        return f"Claude review failed ({label})."
+    return "Claude review failed without an error message."
 
 
 def render_markdown(review: dict[str, Any]) -> str:
@@ -579,18 +842,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         focus=args.focus,
         allow_repo_read=args.allow_repo_read,
     )
-    result = run(
+    result = run_claude_stream(
         build_claude_command(args),
         cwd=repo_root,
         input_text=prompt,
-        check=False,
         timeout=args.timeout_seconds,
+        context_size=len(context.encode("utf-8")),
+        requested_model=args.model,
+        effort=args.effort,
     )
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise ReviewError(detail or "Claude review failed.")
+        raise ReviewError(failure_detail(result.stderr, result.stdout))
 
-    review = extract_review(result.stdout)
+    review = extract_stream_review(result.stdout)
     if args.json:
         print(json.dumps(review, indent=2))
     else:
