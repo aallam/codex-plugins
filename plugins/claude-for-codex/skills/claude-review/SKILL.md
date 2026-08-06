@@ -87,7 +87,13 @@ Run it with the user's repository as the current working directory.
    session. The wrapper still restricts Claude to its documented read-only
    tools and filtered context.
 
-8. Verify Claude's findings locally:
+8. Treat the wrapper's stderr updates as lifecycle evidence. It reports elapsed
+   time and observable Claude events, but cannot know the percentage complete.
+   Never say a review is "taking longer than usual" unless measured historical
+   timing data for a comparable model, effort, context size, and access mode is
+   available. Otherwise report only the elapsed time and latest observed event.
+
+9. Verify Claude's findings locally:
 
    - Open the cited files and lines.
    - Confirm the behavior is introduced by the reviewed changes.
@@ -105,6 +111,8 @@ Run it with the user's repository as the current working directory.
 
 ## Output
 
-The script returns a concise Markdown review by default. Use `--json` only when
-machine-readable findings are materially useful. If Claude returns no findings,
-say so and mention any coverage gaps Claude identified.
+The script writes concise lifecycle updates to stderr while Claude runs, then
+returns a Markdown review on stdout. This keeps progress visible without mixing
+it into the review or exposing Claude's partial reasoning and tool inputs. Use
+`--json` only when machine-readable findings are materially useful. If Claude
+returns no findings, say so and mention any coverage gaps Claude identified.

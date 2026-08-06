@@ -13,6 +13,7 @@ stays in control and invokes your local Claude Code CLI as a read-only reviewer.
 - Run an adversarial review that challenges design choices and failure modes.
 - Focus Claude on concerns such as authentication, concurrency, rollback, or
   backwards compatibility.
+- See elapsed time and safe lifecycle events while a review is running.
 - Receive structured findings that Codex verifies against the checkout.
 
 Claude gets no tools by default and reviews only a filtered diff. The optional
@@ -101,6 +102,7 @@ The wrapper:
 - enables safe mode and disables Chrome integration;
 - disables Claude session persistence;
 - caps a run at 10 minutes and a $2 API budget by default;
+- streams lifecycle updates without exposing partial reasoning or tool inputs;
 - never applies Claude's suggestions automatically;
 - asks Codex to verify findings locally before reporting them.
 
