@@ -1,6 +1,6 @@
 {
   "name": "claude-for-codex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Ask the local Claude Code CLI for a read-only second opinion on code changes.",
   "author": {
     "name": "Mouaad Aallam",
