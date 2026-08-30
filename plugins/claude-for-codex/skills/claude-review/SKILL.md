@@ -100,6 +100,26 @@ Run it with the user's repository as the current working directory.
    - Discard style-only, speculative, or pre-existing issues.
    - Lead with confirmed findings ordered by severity.
 
+10. For a back-and-forth review, use the saved review ID printed on stderr:
+
+    ```bash
+    <plugin-root>/scripts/claude-review --follow-up <review-id>
+    ```
+
+    The wrapper supplies the previous findings and reviewed-state metadata with
+    the current filtered diff. It asks Claude to disposition every prior finding
+    and avoid repeating resolved findings. A branch review inherits its saved
+    `--base` unless the caller intentionally overrides it. Continue to verify the
+    follow-up result locally.
+
+11. If command output was lost after the review completed, recover the saved
+    result without contacting Claude:
+
+    ```bash
+    <plugin-root>/scripts/claude-review --show-review latest
+    <plugin-root>/scripts/claude-review --show-review <review-id> --json
+    ```
+
 ## Examples
 
 ```bash
@@ -107,6 +127,7 @@ Run it with the user's repository as the current working directory.
 <plugin-root>/scripts/claude-review --base main
 <plugin-root>/scripts/claude-review --adversarial --focus "auth and tenant isolation"
 <plugin-root>/scripts/claude-review --base origin/main --focus "rollback safety"
+<plugin-root>/scripts/claude-review --follow-up <review-id> --focus "verify fixes"
 ```
 
 ## Output
@@ -116,3 +137,11 @@ returns a Markdown review on stdout. This keeps progress visible without mixing
 it into the review or exposing Claude's partial reasoning and tool inputs. Use
 `--json` only when machine-readable findings are materially useful. If Claude
 returns no findings, say so and mention any coverage gaps Claude identified.
+
+Before printing the result, the wrapper atomically saves `metadata.json`,
+`review.json`, and `report.md` under
+`.git/codex-reviews/claude/<review-id>/`. Metadata records the repository,
+reviewed HEAD, scope, model controls, and SHA-256/size of the filtered context;
+the source diff itself is not copied. Finding IDs in the saved report remain
+stable input for follow-up verification. Use `--no-save-review` only when the
+user explicitly does not want local review artifacts.

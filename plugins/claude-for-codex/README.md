@@ -14,6 +14,10 @@ stays in control and invokes your local Claude Code CLI as a read-only reviewer.
 - Focus Claude on concerns such as authentication, concurrency, rollback, or
   backwards compatibility.
 - See elapsed time and safe lifecycle events while a review is running.
+- Re-run a focused verification against a saved review instead of manually
+  reconstructing the previous findings.
+- Recover completed review output from a local artifact if the calling session
+  disconnects or loses stdout.
 - Receive structured findings that Codex verifies against the checkout.
 
 Claude gets no tools by default and reviews only a filtered diff. The optional
@@ -79,12 +83,27 @@ plugins/claude-for-codex/scripts/claude-review --base main
 plugins/claude-for-codex/scripts/claude-review \
   --adversarial \
   --focus "race conditions and retry behavior"
+plugins/claude-for-codex/scripts/claude-review --follow-up <review-id>
+plugins/claude-for-codex/scripts/claude-review --show-review latest
 ```
 
 Use `--model` or `--effort` only when you intentionally want to override your
 Claude defaults. Use `--allow-repo-read` only when you intentionally want
 Claude to inspect files beyond the filtered diff. Use `--json` for
 machine-readable output.
+
+Each completed review is saved atomically under
+`.git/codex-reviews/claude/<review-id>/` before stdout is printed. The artifact
+contains the structured review, rendered Markdown, and reviewed-state metadata
+such as HEAD, scope, model controls, and the filtered-context hash and size. It
+does not copy the source diff. The review ID is printed on stderr.
+
+After applying fixes, pass that ID to `--follow-up`. The current review inherits
+the saved base ref when applicable, supplies previous finding IDs to Claude, and
+asks for explicit resolved/partial/unresolved/superseded dispositions. Use
+`--show-review <id>` or `--show-review latest` to recover an artifact without
+contacting Claude. `--no-save-review` disables local persistence for an
+exceptional one-off run.
 
 ## Privacy and safety
 
@@ -101,6 +120,8 @@ The wrapper:
 - runs Claude in plan mode and never enables write or shell tools;
 - enables safe mode and disables Chrome integration;
 - disables Claude session persistence;
+- stores only the validated review and reviewed-state metadata under local Git
+  metadata, never a second copy of the source diff;
 - caps a run at 10 minutes and a $2 API budget by default;
 - streams lifecycle updates without exposing partial reasoning or tool inputs;
 - never applies Claude's suggestions automatically;
@@ -118,6 +139,6 @@ python3 /path/to/plugin-creator/scripts/validate_plugin.py \
 
 ## Scope
 
-The first release intentionally stays synchronous and review-only. Background
-jobs, writable delegation, and automatic review gates add state and permission
-risk; they can be layered on after this core flow is proven reliable.
+The plugin remains synchronous, read-only, and non-delegating. Its local
+artifacts support recovery and explicit follow-up verification; they are not
+provider sessions, background jobs, writable delegation, or automatic gates.

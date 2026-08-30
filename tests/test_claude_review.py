@@ -37,6 +37,261 @@ claude_review = load_script()
 
 
 class ClaudeReviewTests(unittest.TestCase):
+    def test_saved_review_round_trips_without_copying_diff(self) -> None:
+        review = {
+            "verdict": "request_changes",
+            "summary": "One issue.",
+            "findings": [
+                {
+                    "severity": "medium",
+                    "title": "Broken invariant",
+                    "file": "app.py",
+                    "line": 3,
+                    "evidence": "The handler skips validation.",
+                    "recommendation": "Validate before applying.",
+                    "confidence": "high",
+                }
+            ],
+            "coverage_gaps": [],
+            "next_steps": [],
+        }
+        args = argparse.Namespace(
+            base=None,
+            model=None,
+            effort="high",
+            focus="validation",
+            adversarial=True,
+            allow_repo_read=False,
+        )
+        diff_marker = "PRIVATE_DIFF_MARKER"
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            artifacts = Path(directory) / "artifacts"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=repo,
+                check=True,
+            )
+            (repo / "app.py").write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "commit.gpgsign=false", "commit", "-qm", "initial"],
+                cwd=repo,
+                check=True,
+            )
+
+            review_id, artifact_dir = claude_review.save_review_artifact(
+                artifacts,
+                repo_root=repo,
+                review=review,
+                scope="working tree",
+                context=diff_marker,
+                args=args,
+                started_at="2026-08-30T10:00:00Z",
+                previous_review_id=None,
+            )
+            metadata, loaded, loaded_dir = claude_review.load_review_artifact(
+                artifacts,
+                review_id,
+                repo_root=repo,
+            )
+
+            self.assertEqual(loaded_dir, artifact_dir)
+            self.assertEqual(loaded["findings"][0]["id"], "F001")
+            self.assertEqual(metadata["context_bytes"], len(diff_marker))
+            self.assertEqual((artifacts / "latest").read_text().strip(), review_id)
+            self.assertIn("[F001]", (artifact_dir / "report.md").read_text())
+            stored = "\n".join(
+                path.read_text(encoding="utf-8") for path in artifact_dir.iterdir()
+            )
+            self.assertNotIn(diff_marker, stored)
+
+    def test_follow_up_prompt_carries_previous_finding_ids(self) -> None:
+        previous = {
+            "verdict": "request_changes",
+            "summary": "Fix it.",
+            "findings": [
+                {
+                    "id": "F001",
+                    "severity": "medium",
+                    "title": "Broken invariant",
+                    "file": "app.py",
+                    "line": 3,
+                    "evidence": "Validation is missing.",
+                    "recommendation": "Add validation.",
+                    "confidence": "high",
+                }
+            ],
+            "coverage_gaps": [],
+            "next_steps": [],
+        }
+
+        prompt = claude_review.build_prompt(
+            repo_root=Path("/repo"),
+            scope="working tree",
+            context="CURRENT_DIFF",
+            adversarial=True,
+            focus="verify fixes",
+            allow_repo_read=False,
+            previous_review=(
+                {
+                    "review_id": "review-1",
+                    "head": "abc123",
+                    "context_sha256": "def456",
+                },
+                previous,
+            ),
+        )
+
+        self.assertIn("Previous review ID: review-1", prompt)
+        self.assertIn('"id": "F001"', prompt)
+        self.assertIn("partially resolved", prompt)
+        self.assertIn("CURRENT_DIFF", prompt)
+
+    def test_follow_up_preserves_prior_ids_and_does_not_reuse_resolved_ids(self) -> None:
+        finding = {
+            "severity": "medium",
+            "title": "Issue",
+            "file": "app.py",
+            "line": 3,
+            "evidence": "Evidence.",
+            "recommendation": "Fix it.",
+            "confidence": "high",
+        }
+        review = {
+            "verdict": "request_changes",
+            "summary": "Issues remain.",
+            "findings": [{**finding, "id": "F002"}, {**finding, "title": "New"}],
+            "coverage_gaps": [],
+            "next_steps": [],
+        }
+
+        annotated = claude_review.review_with_finding_ids(
+            review,
+            reserved_ids={"F001", "F002"},
+        )
+
+        self.assertEqual(
+            [item["id"] for item in annotated["findings"]],
+            ["F002", "F003"],
+        )
+
+    def test_saved_review_rejects_duplicate_finding_ids(self) -> None:
+        finding = {
+            "id": "F001",
+            "severity": "medium",
+            "title": "Issue",
+            "file": "app.py",
+            "line": 3,
+            "evidence": "Evidence.",
+            "recommendation": "Fix it.",
+            "confidence": "high",
+        }
+        review = {
+            "verdict": "request_changes",
+            "summary": "Issues remain.",
+            "findings": [finding, {**finding, "title": "Another issue"}],
+            "coverage_gaps": [],
+            "next_steps": [],
+        }
+
+        with self.assertRaisesRegex(claude_review.ReviewError, "duplicate finding IDs"):
+            claude_review.review_with_finding_ids(review)
+
+    def test_default_artifact_directory_supports_git_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "worktree"
+            git_dir = root / "git" / "worktrees" / "feature"
+            repo.mkdir()
+            git_dir.mkdir(parents=True)
+            (repo / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+
+            self.assertEqual(
+                claude_review.default_artifacts_dir(repo),
+                git_dir.resolve() / "codex-reviews" / "claude",
+            )
+
+    def test_show_review_does_not_contact_claude(self) -> None:
+        review = {
+            "verdict": "approve",
+            "summary": "Looks good.",
+            "findings": [],
+            "coverage_gaps": [],
+            "next_steps": [],
+        }
+        args = argparse.Namespace(
+            base=None,
+            model=None,
+            effort=None,
+            focus=None,
+            adversarial=False,
+            allow_repo_read=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            artifacts = Path(directory) / "artifacts"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=repo,
+                check=True,
+            )
+            (repo / "app.py").write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "commit.gpgsign=false", "commit", "-qm", "initial"],
+                cwd=repo,
+                check=True,
+            )
+            claude_review.save_review_artifact(
+                artifacts,
+                repo_root=repo,
+                review=review,
+                scope="working tree",
+                context="diff",
+                args=args,
+                started_at="2026-08-30T10:00:00Z",
+                previous_review_id=None,
+            )
+
+            with (
+                mock.patch.object(claude_review, "find_repo_root", return_value=repo),
+                mock.patch.object(
+                    claude_review.shutil,
+                    "which",
+                    side_effect=AssertionError("Claude must not be resolved"),
+                ),
+                mock.patch("builtins.print") as printer,
+            ):
+                exit_code = claude_review.main(
+                    [
+                        "--show-review",
+                        "latest",
+                        "--artifacts-dir",
+                        str(artifacts),
+                        "--json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        shown = json.loads(printer.call_args.args[0])
+        self.assertEqual(shown["verdict"], "approve")
+
     def test_command_is_read_only(self) -> None:
         args = argparse.Namespace(
             claude_binary="/usr/local/bin/claude",
@@ -436,7 +691,14 @@ class ClaudeReviewTests(unittest.TestCase):
                 ) as runner,
                 mock.patch("builtins.print"),
             ):
-                exit_code = claude_review.main(["--claude-binary", str(claude), "--json"])
+                exit_code = claude_review.main(
+                    [
+                        "--claude-binary",
+                        str(claude),
+                        "--json",
+                        "--no-save-review",
+                    ]
+                )
 
             self.assertEqual(exit_code, 0)
             command = runner.call_args.args[0]

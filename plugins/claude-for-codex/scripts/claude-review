@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +21,10 @@ from typing import Any, Sequence, TextIO
 DEFAULT_MAX_DIFF_BYTES = 400_000
 DEFAULT_MAX_BUDGET_USD = 2.0
 DEFAULT_TIMEOUT_SECONDS = 600
+MAX_ARTIFACT_BYTES = 1_000_000
+MAX_FOLLOW_UP_REVIEW_BYTES = 100_000
+ARTIFACT_SCHEMA_VERSION = 1
+REVIEWER_ID = "claude"
 PROGRESS_INTERVAL_SECONDS = 30
 READ_ONLY_TOOLS = "Read,Glob,Grep"
 PROGRESS_TOOLS = frozenset(READ_ONLY_TOOLS.split(","))
@@ -71,6 +77,10 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     "confidence",
                 ],
                 "properties": {
+                    "id": {
+                        "type": "string",
+                        "pattern": "^F[0-9]{3}$",
+                    },
                     "severity": {
                         "type": "string",
                         "enum": ["blocker", "high", "medium", "low"],
@@ -106,6 +116,182 @@ REVIEW_SCHEMA: dict[str, Any] = {
 
 class ReviewError(RuntimeError):
     """A user-actionable review failure."""
+
+
+def utc_now() -> str:
+    """Return an RFC 3339 UTC timestamp suitable for artifact metadata."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def default_artifacts_dir(repo_root: Path) -> Path:
+    """Keep local review artifacts inside Git metadata, including in worktrees."""
+    dot_git = repo_root / ".git"
+    if dot_git.is_dir():
+        git_dir = dot_git
+    elif dot_git.is_file():
+        marker = dot_git.read_text(encoding="utf-8").strip()
+        if not marker.startswith("gitdir: "):
+            raise ReviewError(f"Could not resolve Git metadata from {dot_git}.")
+        candidate = Path(marker.removeprefix("gitdir: "))
+        git_dir = candidate if candidate.is_absolute() else (repo_root / candidate)
+    else:
+        raise ReviewError(f"Could not find Git metadata for {repo_root}.")
+    return git_dir.resolve() / "codex-reviews" / REVIEWER_ID
+
+
+def resolve_artifacts_dir(repo_root: Path, override: str | None) -> Path:
+    """Resolve the configured artifact root without accepting an empty path."""
+    if override and override.strip():
+        return Path(override).expanduser().resolve()
+    return default_artifacts_dir(repo_root)
+
+
+def atomic_write(path: Path, content: str) -> None:
+    """Atomically write a private UTF-8 artifact file."""
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def artifact_reference_path(artifacts_dir: Path, reference: str) -> Path:
+    """Resolve an artifact ID or explicit artifact directory."""
+    explicit = Path(reference).expanduser()
+    if (explicit.is_absolute() or len(explicit.parts) > 1) and explicit.exists():
+        return explicit.resolve()
+    if reference == "latest":
+        latest = artifacts_dir / "latest"
+        if not latest.is_file():
+            raise ReviewError(f"No saved Claude review exists in {artifacts_dir}.")
+        reference = latest.read_text(encoding="utf-8").strip()
+    if not reference or Path(reference).name != reference:
+        raise ReviewError("Review reference must be an artifact ID or existing path.")
+    return artifacts_dir / reference
+
+
+def load_review_artifact(
+    artifacts_dir: Path,
+    reference: str,
+    *,
+    repo_root: Path,
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    """Load and validate a saved review from the same repository."""
+    artifact_dir = artifact_reference_path(artifacts_dir, reference)
+    metadata_path = artifact_dir / "metadata.json"
+    review_path = artifact_dir / "review.json"
+    for path in (metadata_path, review_path):
+        if not path.is_file():
+            raise ReviewError(f"Saved review is missing {path.name}: {artifact_dir}")
+        if path.stat().st_size > MAX_ARTIFACT_BYTES:
+            raise ReviewError(f"Saved review file is too large to load: {path}")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        raise ReviewError(f"Could not read saved review {artifact_dir}: {error}") from error
+    if not isinstance(metadata, dict) or not isinstance(review, dict):
+        raise ReviewError(f"Saved review has invalid JSON objects: {artifact_dir}")
+    if Path(str(metadata.get("repository", ""))).resolve() != repo_root.resolve():
+        raise ReviewError("Saved review belongs to a different repository.")
+    validate_review(review)
+    return metadata, review, artifact_dir
+
+
+def review_with_finding_ids(
+    review: dict[str, Any],
+    *,
+    reserved_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Copy a review and add stable IDs for follow-up verification."""
+    annotated = json.loads(json.dumps(review))
+    finding_ids = [
+        finding["id"]
+        for finding in annotated.get("findings", [])
+        if isinstance(finding.get("id"), str)
+    ]
+    if len(finding_ids) != len(set(finding_ids)):
+        raise ReviewError("Saved review contains duplicate finding IDs.")
+    used_ids = set(reserved_ids or ())
+    used_ids.update(finding_ids)
+    next_id = max((int(value[1:]) for value in used_ids), default=0) + 1
+    for finding in annotated.get("findings", []):
+        if "id" in finding:
+            continue
+        if next_id > 999:
+            raise ReviewError("Saved review has too many findings to assign stable IDs.")
+        while f"F{next_id:03d}" in used_ids:
+            next_id += 1
+        finding["id"] = f"F{next_id:03d}"
+        used_ids.add(finding["id"])
+        next_id += 1
+    return annotated
+
+
+def save_review_artifact(
+    artifacts_dir: Path,
+    *,
+    repo_root: Path,
+    review: dict[str, Any],
+    scope: str,
+    context: str,
+    args: argparse.Namespace,
+    started_at: str,
+    previous_review_id: str | None,
+    reserved_finding_ids: set[str] | None = None,
+) -> tuple[str, Path]:
+    """Persist a complete review atomically without storing the source diff."""
+    context_digest = hashlib.sha256(context.encode("utf-8")).hexdigest()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    base_id = f"{timestamp}-{context_digest[:8]}"
+    artifacts_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    artifacts_dir.chmod(0o700)
+    artifact_id = base_id
+    suffix = 2
+    while (artifacts_dir / artifact_id).exists():
+        artifact_id = f"{base_id}-{suffix}"
+        suffix += 1
+
+    staging = artifacts_dir / f".{artifact_id}.tmp-{os.getpid()}"
+    staging.mkdir(mode=0o700)
+    try:
+        head = run(["git", "rev-parse", "HEAD"], cwd=repo_root).stdout.strip()
+        metadata = {
+            "schema_version": ARTIFACT_SCHEMA_VERSION,
+            "review_id": artifact_id,
+            "reviewer": REVIEWER_ID,
+            "repository": str(repo_root.resolve()),
+            "head": head,
+            "base": args.base,
+            "scope": scope,
+            "context_sha256": context_digest,
+            "context_bytes": len(context.encode("utf-8")),
+            "model": args.model or "default",
+            "effort": args.effort,
+            "focus": args.focus,
+            "adversarial": args.adversarial,
+            "allow_repo_read": args.allow_repo_read,
+            "previous_review_id": previous_review_id,
+            "started_at": started_at,
+            "completed_at": utc_now(),
+        }
+        annotated = review_with_finding_ids(review, reserved_ids=reserved_finding_ids)
+        for name, content in (
+            ("metadata.json", json.dumps(metadata, indent=2) + "\n"),
+            ("review.json", json.dumps(annotated, indent=2) + "\n"),
+            ("report.md", render_markdown(annotated)),
+        ):
+            path = staging / name
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o600)
+        staging.replace(artifacts_dir / artifact_id)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    atomic_write(artifacts_dir / "latest", artifact_id + "\n")
+    return artifact_id, artifacts_dir / artifact_id
 
 
 def run(
@@ -475,6 +661,7 @@ def build_prompt(
     adversarial: bool,
     focus: str | None,
     allow_repo_read: bool,
+    previous_review: tuple[dict[str, Any], dict[str, Any]] | None = None,
 ) -> str:
     """Build the Claude reviewer prompt."""
     mode = (
@@ -490,6 +677,23 @@ def build_prompt(
         if allow_repo_read
         else "Do not use repository tools. Review only the supplied diff context."
     )
+    follow_up_text = ""
+    if previous_review:
+        metadata, review = previous_review
+        follow_up_text = f"""
+
+Follow-up verification:
+- Previous review ID: {metadata.get('review_id', 'unknown')}
+- Previous reviewed HEAD: {metadata.get('head', 'unknown')}
+- Previous context SHA-256: {metadata.get('context_sha256', 'unknown')}
+- Verify every previous finding against the current checkout.
+- Reuse its finding ID when a problem remains. Do not repeat resolved findings as new findings.
+- State the disposition of every previous finding in the summary: resolved,
+  partially resolved, not resolved, or superseded.
+
+Previous structured review:
+{json.dumps(review, indent=2)}
+"""
     return f"""You are an independent reviewer. {mode}
 
 Repository: {repo_root}
@@ -505,7 +709,11 @@ Hard constraints:
 - Do not report style preferences, generic best practices, or pre-existing issues.
 - Verify each finding against surrounding code before reporting it.
 - Use repository-relative file paths and the tightest relevant line number.
+- In evidence, include the nearest heading, symbol, or stable text anchor because line numbers move.
+- Distinguish confirmed contradictions, unsafe ambiguity, missing contracts, and editorial notes;
+  do not elevate optional improvements into required changes.
 - If evidence is incomplete, lower confidence or put it in coverage_gaps instead.
+{follow_up_text}
 
 Return the requested structured review with findings ordered by severity.
 
@@ -581,6 +789,14 @@ def validate_review(review: dict[str, Any]) -> dict[str, Any]:
             raise ReviewError(f"Claude finding {index + 1} has invalid severity.")
         if finding["confidence"] not in {"high", "medium", "low"}:
             raise ReviewError(f"Claude finding {index + 1} has invalid confidence.")
+        finding_id = finding.get("id")
+        if finding_id is not None and (
+            not isinstance(finding_id, str)
+            or len(finding_id) != 4
+            or not finding_id.startswith("F")
+            or not finding_id[1:].isdigit()
+        ):
+            raise ReviewError(f"Claude finding {index + 1} has invalid ID.")
         for field in ("title", "file", "evidence", "recommendation"):
             if not isinstance(finding[field], str):
                 raise ReviewError(
@@ -681,10 +897,11 @@ def render_markdown(review: dict[str, Any]) -> str:
             location = str(finding["file"])
             if finding.get("line"):
                 location += f":{finding['line']}"
+            finding_id = f"[{finding['id']}] " if finding.get("id") else ""
             lines.extend(
                 [
                     "",
-                    f"- [{str(finding['severity']).upper()}] {finding['title']} "
+                    f"- [{str(finding['severity']).upper()}] {finding_id}{finding['title']} "
                     f"({location}, confidence: {finding['confidence']})",
                     f"  Evidence: {finding['evidence']}",
                     f"  Recommendation: {finding['recommendation']}",
@@ -780,6 +997,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--json", action="store_true", help="Print structured JSON.")
     parser.add_argument(
+        "--follow-up",
+        metavar="REVIEW",
+        help="Verify a saved review ID or artifact directory against current changes.",
+    )
+    parser.add_argument(
+        "--show-review",
+        metavar="REVIEW",
+        help="Print a saved review ID (or 'latest') without contacting Claude.",
+    )
+    parser.add_argument(
+        "--artifacts-dir",
+        help="Override the default .git/codex-reviews/claude artifact directory.",
+    )
+    parser.add_argument(
+        "--no-save-review",
+        action="store_true",
+        help="Do not persist the completed review as a local Git artifact.",
+    )
+    parser.add_argument(
         "--max-diff-bytes",
         type=positive_int,
         default=DEFAULT_MAX_DIFF_BYTES,
@@ -820,6 +1056,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.check:
         return check_claude(args.claude_binary)
+    if args.follow_up and args.show_review:
+        raise ReviewError("--follow-up and --show-review cannot be used together.")
+
+    repo_root = find_repo_root(Path.cwd())
+    if args.show_review:
+        artifacts_dir = resolve_artifacts_dir(repo_root, args.artifacts_dir)
+        _, review, artifact_dir = load_review_artifact(
+            artifacts_dir,
+            args.show_review,
+            repo_root=repo_root,
+        )
+        if args.json:
+            print(json.dumps(review, indent=2))
+        else:
+            report = artifact_dir / "report.md"
+            print(report.read_text(encoding="utf-8"), end="")
+        return 0
+
+    previous_metadata = None
+    previous_review = None
+    previous_review_id = None
+    reserved_finding_ids: set[str] = set()
+    artifacts_dir = None
+    if args.follow_up:
+        artifacts_dir = resolve_artifacts_dir(repo_root, args.artifacts_dir)
+        previous_metadata, previous_review, _ = load_review_artifact(
+            artifacts_dir,
+            args.follow_up,
+            repo_root=repo_root,
+        )
+        previous_review_id = str(previous_metadata.get("review_id", "")) or None
+        if len(json.dumps(previous_review).encode("utf-8")) > MAX_FOLLOW_UP_REVIEW_BYTES:
+            raise ReviewError("Saved review is too large to use as follow-up context.")
+        reserved_finding_ids = {
+            finding["id"]
+            for finding in previous_review.get("findings", [])
+            if isinstance(finding.get("id"), str)
+        }
+        if args.base is None and isinstance(previous_metadata.get("base"), str):
+            args.base = previous_metadata["base"]
 
     resolved = shutil.which(args.claude_binary)
     if not resolved:
@@ -828,12 +1104,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     args.claude_binary = resolved
 
-    repo_root = find_repo_root(Path.cwd())
     scope, context = collect_review_context(
         repo_root,
         base=args.base,
         max_diff_bytes=args.max_diff_bytes,
     )
+    if artifacts_dir is None and not args.no_save_review:
+        artifacts_dir = resolve_artifacts_dir(repo_root, args.artifacts_dir)
     prompt = build_prompt(
         repo_root=repo_root,
         scope=scope,
@@ -841,7 +1118,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         adversarial=args.adversarial,
         focus=args.focus,
         allow_repo_read=args.allow_repo_read,
+        previous_review=(previous_metadata, previous_review)
+        if previous_metadata is not None and previous_review is not None
+        else None,
     )
+    started_at = utc_now()
     result = run_claude_stream(
         build_claude_command(args),
         cwd=repo_root,
@@ -855,6 +1136,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ReviewError(failure_detail(result.stderr, result.stdout))
 
     review = extract_stream_review(result.stdout)
+    if not args.no_save_review:
+        assert artifacts_dir is not None
+        try:
+            artifact_id, artifact_dir = save_review_artifact(
+                artifacts_dir,
+                repo_root=repo_root,
+                review=review,
+                scope=scope,
+                context=context,
+                args=args,
+                started_at=started_at,
+                previous_review_id=previous_review_id,
+                reserved_finding_ids=reserved_finding_ids,
+            )
+        except (OSError, ReviewError) as error:
+            emit_progress(
+                sys.stderr,
+                f"Warning: could not save review artifact: {error}",
+            )
+        else:
+            emit_progress(
+                sys.stderr,
+                f"Saved review {artifact_id} to {artifact_dir}",
+            )
     if args.json:
         print(json.dumps(review, indent=2))
     else:
