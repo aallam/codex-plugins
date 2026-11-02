@@ -32,6 +32,28 @@ relative to the user's repository:
 
 Run it with the user's repository as the current working directory.
 
+## Review brief
+
+Pin the comparison base and final reviewed state. When repository reads are
+allowed, run from a checkout matching that state so surrounding files do not
+come from a different revision.
+
+Give a neutral statement of intended behavior and acceptance criteria. Treat
+author explanations as claims to verify; keep implementation history and other
+reviewers' conclusions out of the first pass.
+
+Include the following in `--focus`, alongside any requested risk focus:
+
+> Compare old and new behavioral guarantees by following affected callers and
+> dependencies through success, failure, and partial completion. Derive guarantees
+> from source and callers, including behavior outside the acceptance criteria. Find
+> concrete regressions, including those exposed through unchanged code. Check
+> whether test assertions cover interacting conditions rather than relying on
+> passing results.
+> Investigate material gaps using available repository context. Leave unresolved
+> behaviors explicitly unverified rather than treating missing evidence as a clean
+> verdict. Report the paths and behaviors inspected and material coverage gaps.
+
 ## Workflow
 
 1. Run setup diagnostics:
@@ -77,9 +99,10 @@ Run it with the user's repository as the current working directory.
    Do not choose a paid model or increase effort unless the user asks or their
    existing Claude defaults already do so.
 
-6. Add `--allow-repo-read` only when the user explicitly authorizes Claude to
-   inspect repository files beyond the supplied diff. This enables `Read`,
-   `Glob`, and `Grep`, but remains read-only.
+6. Use `--allow-repo-read` when the user explicitly authorizes surrounding
+   repository context, including standing authorization in applicable user
+   instructions. This enables `Read`, `Glob`, and `Grep`, but remains read-only.
+   Otherwise retain diff-only access and report material missing context.
 
 7. On macOS, run the selected review command with the same scoped sandbox
    escalation used for `--check`; the review process needs the same Keychain
@@ -96,8 +119,11 @@ Run it with the user's repository as the current working directory.
 9. Verify Claude's findings locally:
 
    - Open the cited files and lines.
-   - Confirm the behavior is introduced by the reviewed changes.
-   - Discard style-only, speculative, or pre-existing issues.
+   - Confirm the change causes or worsens the behavior, including regressions
+     exposed through unchanged callers or dependencies.
+   - Discard style-only, speculative, or pre-existing issues. Support dismissals
+     with source evidence establishing the disputed guarantee or a focused
+     reproduction; reuse and passing tests alone are insufficient.
    - Lead with confirmed findings ordered by severity.
 
 10. For a back-and-forth review, use the saved review ID printed on stderr:
@@ -109,8 +135,11 @@ Run it with the user's repository as the current working directory.
     The wrapper supplies the previous findings and reviewed-state metadata with
     the current filtered diff. It asks Claude to disposition every prior finding
     and avoid repeating resolved findings. A branch review inherits its saved
-    `--base` unless the caller intentionally overrides it. Continue to verify the
-    follow-up result locally.
+    `--base` unless the caller intentionally overrides it. Send neutral evidence
+    for disputed findings rather than steering toward approval. Continue to
+    verify the follow-up result locally; a follow-up is not a fresh independent
+    review. If substantive changes or a material gap need a fresh pass, omit
+    `--follow-up` and withhold prior conclusions.
 
 11. If command output was lost after the review completed, recover the saved
     result without contacting Claude:
